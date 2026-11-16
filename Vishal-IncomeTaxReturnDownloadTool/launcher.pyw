@@ -27,6 +27,7 @@ why - read that message before asking for help.
 
 import http.client
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -101,6 +102,27 @@ def _find_base_python():
     return None
 
 
+def _venv_is_healthy(venv_python, log):
+    """
+    A venv can exist on disk (python.exe is there) but still be useless:
+    created with the wrong Python version (e.g. a 3.14 default instead
+    of 3.12, which is what broke a prior run - greenlet/pyyaml have no
+    prebuilt wheels for 3.14), or left half-installed after a failed
+    pip install. Treat it as unhealthy in either case so it gets
+    rebuilt automatically instead of silently reusing a broken one.
+    """
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-c",
+             "import sys, fastapi, uvicorn, playwright; "
+             "assert sys.version_info[:2] == (3, 12)"],
+            capture_output=True, cwd=str(BASE_DIR),
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def ensure_venv(log):
     """
     Double-clicking a .pyw file runs it with whichever Python Windows
@@ -109,11 +131,27 @@ def ensure_venv(log):
     actually installed). On a computer that has never run this tool
     before, there IS no venv yet - so create one, install
     requirements.txt into it, and install Playwright's Chromium,
-    all automatically, the first time. Later runs just reuse it.
+    all automatically, the first time. Later runs just reuse it -
+    unless it turns out to be broken (wrong Python version, or a
+    previous install that failed partway through), in which case it
+    is deleted and rebuilt automatically rather than asking the user
+    to fix or delete anything by hand.
     """
     existing = _venv_python_path()
-    if existing:
+    if existing and _venv_is_healthy(existing, log):
         return str(existing)
+
+    if existing:
+        log("A previous setup on this computer didn't finish correctly "
+            "(wrong Python version or an incomplete install) - "
+            "rebuilding it automatically...")
+        try:
+            shutil.rmtree(VENV_DIR)
+        except Exception as exc:
+            log(f"ERROR: Could not remove the old setup folder automatically "
+                f"({exc}). Please delete the 'venv' folder in this project "
+                f"by hand, then double-click launcher.pyw again.")
+            return None
 
     log("First run on this computer - setting up Python packages "
         "(fastapi, uvicorn, playwright). This can take a few minutes, "
@@ -135,6 +173,12 @@ def ensure_venv(log):
         return None
 
     req_file = BASE_DIR / "requirements.txt"
+    if not _run_setup_step(
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        log, "Updating pip...",
+    ):
+        return None
+
     if not _run_setup_step(
         [str(venv_python), "-m", "pip", "install", "-r", str(req_file)],
         log, "Installing required packages (fastapi, uvicorn, playwright)...",
