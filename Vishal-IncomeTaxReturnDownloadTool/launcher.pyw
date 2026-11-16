@@ -84,43 +84,100 @@ def _run_setup_step(cmd, log, label):
     return True
 
 
-def _find_base_python():
+def _available_base_pythons():
     """
-    A base/system Python to create the venv with (this project needs
-    3.12 or similar - not 3.14, where Playwright's dependencies don't
-    yet have prebuilt wheels). Prefer the Windows Python launcher's
-    3.12 if present, otherwise fall back to whatever "python" is on
-    PATH and hope it's compatible.
+    Every Python on this computer worth trying, newest-first (prefer
+    whatever is already the system default - most likely to already
+    be set up and on PATH), with known-reliable older versions as a
+    fallback. Which exact version ends up working depends on whether
+    its packages (greenlet, pyyaml, ...) currently ship prebuilt
+    wheels for that Python - that changes over time as those projects
+    catch up to each new Python release, so instead of hardcoding one
+    required version, every candidate found is actually tried (see
+    ensure_venv) and whichever one completes the full install first
+    is kept.
     """
-    for candidate in (["py", "-3.12"], ["python3.12"], ["python"], ["py"]):
+    candidates = [["python"], ["py"]]
+    for minor in (14, 13, 12, 11):
+        candidates.append(["py", f"-3.{minor}"])
+    found = []
+    for candidate in candidates:
         try:
             subprocess.run(candidate + ["--version"], check=True,
                             capture_output=True, cwd=str(BASE_DIR))
-            return candidate
+            if candidate not in found:
+                found.append(candidate)
         except Exception:
             continue
-    return None
+    return found
 
 
 def _venv_is_healthy(venv_python, log):
     """
-    A venv can exist on disk (python.exe is there) but still be useless:
-    created with the wrong Python version (e.g. a 3.14 default instead
-    of 3.12, which is what broke a prior run - greenlet/pyyaml have no
-    prebuilt wheels for 3.14), or left half-installed after a failed
-    pip install. Treat it as unhealthy in either case so it gets
+    A venv can exist on disk (python.exe is there) but still be
+    useless: left half-installed after a pip install that failed
+    partway through. Treat it as unhealthy in that case so it gets
     rebuilt automatically instead of silently reusing a broken one.
+    (Which Python version it was built with doesn't matter here -
+    only whether the packages this project needs actually imported
+    successfully in it.)
     """
     try:
         result = subprocess.run(
-            [str(venv_python), "-c",
-             "import sys, fastapi, uvicorn, playwright; "
-             "assert sys.version_info[:2] == (3, 12)"],
+            [str(venv_python), "-c", "import fastapi, uvicorn, playwright"],
             capture_output=True, cwd=str(BASE_DIR),
         )
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _try_build_venv(base_python, log):
+    """
+    Attempt a full venv + pip install + playwright install with ONE
+    candidate base Python. Returns the venv's python.exe path on
+    success, or None on any failure (after cleaning up the attempt,
+    so a failed try never leaves a broken venv behind for the next
+    candidate to trip over).
+    """
+    if VENV_DIR.exists():
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
+
+    version_label = " ".join(base_python)
+    if not _run_setup_step(
+        base_python + ["-m", "venv", str(VENV_DIR)], log,
+        f"Trying Python ({version_label}) - creating environment...",
+    ):
+        return None
+
+    venv_python = _venv_python_path()
+    if not venv_python:
+        log("ERROR: Virtual environment was created but python.exe is missing.")
+        return None
+
+    req_file = BASE_DIR / "requirements.txt"
+    ok = (
+        _run_setup_step(
+            [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+            log, "Updating pip...",
+        )
+        and _run_setup_step(
+            [str(venv_python), "-m", "pip", "install", "-r", str(req_file)],
+            log, f"Installing required packages with Python {version_label}...",
+        )
+    )
+    if not ok:
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
+        return None
+
+    if not _run_setup_step(
+        [str(venv_python), "-m", "playwright", "install", "chromium"],
+        log, "Installing Chromium for Playwright (one-time, a few hundred MB)...",
+    ):
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
+        return None
+
+    return str(venv_python)
 
 
 def ensure_venv(log):
@@ -130,69 +187,49 @@ def ensure_venv(log):
     Python, NOT a project venv (where fastapi/uvicorn/playwright are
     actually installed). On a computer that has never run this tool
     before, there IS no venv yet - so create one, install
-    requirements.txt into it, and install Playwright's Chromium,
-    all automatically, the first time. Later runs just reuse it -
-    unless it turns out to be broken (wrong Python version, or a
-    previous install that failed partway through), in which case it
-    is deleted and rebuilt automatically rather than asking the user
-    to fix or delete anything by hand.
+    requirements.txt into it, and install Playwright's Chromium, all
+    automatically, the first time. Later runs just reuse it - unless
+    it turns out to be broken (an install that failed partway
+    through), in which case it is rebuilt automatically.
+
+    Whichever Python is already the system default (3.12, 3.13, 3.14,
+    whatever) is tried FIRST, since some of this project's packages
+    are native C extensions (e.g. greenlet, used by Playwright) that
+    only get prebuilt wheels for a given Python version some time
+    after that version is released. If the first try's pip install
+    fails because of that, older Python versions are tried one by one
+    automatically until one succeeds - no manual Python version
+    hunting needed.
     """
     existing = _venv_python_path()
     if existing and _venv_is_healthy(existing, log):
         return str(existing)
 
     if existing:
-        log("A previous setup on this computer didn't finish correctly "
-            "(wrong Python version or an incomplete install) - "
+        log("A previous setup on this computer didn't finish correctly - "
             "rebuilding it automatically...")
-        try:
-            shutil.rmtree(VENV_DIR)
-        except Exception as exc:
-            log(f"ERROR: Could not remove the old setup folder automatically "
-                f"({exc}). Please delete the 'venv' folder in this project "
-                f"by hand, then double-click launcher.pyw again.")
-            return None
 
-    log("First run on this computer - setting up Python packages "
-        "(fastapi, uvicorn, playwright). This can take a few minutes, "
-        "only on this first run...")
+    log("Setting up Python packages (fastapi, uvicorn, playwright). "
+        "This can take a few minutes, only on this first run...")
 
-    base_python = _find_base_python()
-    if not base_python:
+    base_pythons = _available_base_pythons()
+    if not base_pythons:
         log("ERROR: No Python installation found on this computer. "
-            "Install Python 3.12 from python.org first, then try again.")
+            "Install Python from python.org first, then try again.")
         return None
 
-    if not _run_setup_step(base_python + ["-m", "venv", str(VENV_DIR)], log,
-                            "Creating a Python environment for this tool..."):
-        return None
+    for base_python in base_pythons:
+        venv_python = _try_build_venv(base_python, log)
+        if venv_python:
+            log("Setup complete.")
+            return venv_python
+        log(f"That Python version didn't work for this project's packages - "
+            f"trying the next available Python version...")
 
-    venv_python = _venv_python_path()
-    if not venv_python:
-        log("ERROR: Virtual environment was created but python.exe is missing.")
-        return None
-
-    req_file = BASE_DIR / "requirements.txt"
-    if not _run_setup_step(
-        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        log, "Updating pip...",
-    ):
-        return None
-
-    if not _run_setup_step(
-        [str(venv_python), "-m", "pip", "install", "-r", str(req_file)],
-        log, "Installing required packages (fastapi, uvicorn, playwright)...",
-    ):
-        return None
-
-    if not _run_setup_step(
-        [str(venv_python), "-m", "playwright", "install", "chromium"],
-        log, "Installing Chromium for Playwright (one-time, a few hundred MB)...",
-    ):
-        return None
-
-    log("Setup complete.")
-    return str(venv_python)
+    log("ERROR: Setup failed with every Python version found on this "
+        "computer. Check setup.log in this folder for the detailed error, "
+        "or install Python 3.12 from python.org and try again.")
+    return None
 
 
 def _port_open(host, port, timeout=0.5):
